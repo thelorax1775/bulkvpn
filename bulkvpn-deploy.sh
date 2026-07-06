@@ -28,6 +28,9 @@
 #   TS_HOSTNAME_PREFIX       hostname prefix; default: "ct-" (LXC) / "vm-" (VM)
 #   TS_EXTRA_ARGS            extra flags appended to every `tailscale up`
 #   MULLVAD_LAN_AUTODETECT   1 (default) = auto-allow each guest's own LAN subnet(s)
+#   MULLVAD_LAN_INCLUDE_GUESTS 1 (default) = also allow every other running
+#                            guest's LAN subnet(s) on the node, so containers,
+#                            VMs, and LXCs stay reachable to each other on the LAN
 #   MULLVAD_LAN_SUBNET       extra subnet(s) to always allow (space/comma sep); default: none
 #   MULLVAD_COUNTRY_FILTER   limit rotation to a country (e.g. "USA"); default: any
 #   PVE_NODE                 Proxmox node to scan; default: `hostname -s`
@@ -45,6 +48,7 @@ TS_HOSTNAME_PREFIX_LXC="${TS_HOSTNAME_PREFIX:-ct-}"
 TS_HOSTNAME_PREFIX_VM="${TS_HOSTNAME_PREFIX:-vm-}"
 TS_EXTRA_ARGS="${TS_EXTRA_ARGS:-}"
 MULLVAD_LAN_AUTODETECT="${MULLVAD_LAN_AUTODETECT:-1}"   # 1 = auto-allow each guest's own LAN
+MULLVAD_LAN_INCLUDE_GUESTS="${MULLVAD_LAN_INCLUDE_GUESTS:-1}"  # 1 = also allow every other running guest's LAN subnet(s)
 MULLVAD_LAN_SUBNET="${MULLVAD_LAN_SUBNET:-}"            # extra subnet(s) to always allow (space/comma sep)
 MULLVAD_COUNTRY_FILTER="${MULLVAD_COUNTRY_FILTER:-}"
 PVE_NODE="${PVE_NODE:-$(hostname -s)}"
@@ -58,7 +62,7 @@ LOG_FILE="/root/bulkvpn-$(date '+%Y%m%d-%H%M%S').log"
 
 SUCCESS=0; SKIPPED=0; FAILED=0
 
-usage() { sed -n '2,45p' "$0"; }
+usage() { sed -n '2,40p' "$0"; }
 [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage; exit 0; }
 
 # Mirror all output to a timestamped log.
@@ -86,6 +90,9 @@ set -euo pipefail
 ### ---- Configuration -------------------------------------------------------
 COUNTRY_FILTER=""              # e.g. "USA"; empty = any country
 ALLOW_LAN=true                 # keep LAN access to the web UI / SSH
+LAN_SUBNETS=""                 # space-separated CIDRs to keep reachable directly
+                               # (off the exit-node tunnel), e.g. other guests' LANs
+LAN_BYPASS_PRIO=5200           # ip-rule priority (above Tailscale's ~5230 diverter)
 LOG_FILE="/var/log/mullvad-rotate.log"
 CHECK_TIMEOUT=8                # seconds per connectivity probe
 TUNNEL_SETTLE=3                # seconds to wait after switching before probing
@@ -99,6 +106,31 @@ log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FIL
 die() { log "ERROR: $*"; exit 1; }
 
 [[ -x "$TAILSCALE" ]] || die "tailscale binary not found at '$TAILSCALE'"
+
+# ensure_lan_bypass: keep the configured LAN subnets reachable *directly* while
+# an exit node is active. Tailscale policy-routes the default route into the
+# tunnel (ip rule at priority ~5230), which otherwise swallows traffic to other
+# LAN subnets reached via the gateway (--exit-node-allow-lan-access only exempts
+# the node's own directly-connected subnet). A higher-priority rule sends these
+# subnets to the main table so they egress via the local gateway instead of the
+# tunnel — so containers/VMs/LXCs on the LAN can still reach each other. These
+# rules are runtime-only, so re-assert them on every run (idempotent).
+ensure_lan_bypass() {
+    [[ -n "$LAN_SUBNETS" ]] || return 0
+    command -v ip >/dev/null 2>&1 || return 0
+    local net
+    for net in $LAN_SUBNETS; do
+        [[ "$net" == */* ]] || continue
+        ip rule del to "$net" lookup main priority "$LAN_BYPASS_PRIO" 2>/dev/null || true
+        if ip rule add to "$net" lookup main priority "$LAN_BYPASS_PRIO" 2>/dev/null; then
+            log "LAN bypass: $net -> main table (direct, off tunnel)"
+        fi
+    done
+}
+
+# Keep the LAN reachable before anything else, on every run (including
+# --check-only heals), so a reboot that comes up healthy still restores it.
+ensure_lan_bypass
 
 verify_connectivity() {
     local host
@@ -233,26 +265,41 @@ HT_EOF
 }
 
 # Templated variants (apply per-deployment config).
-rotate_templated() {
-    asset_rotate | sed "s|^COUNTRY_FILTER=.*|COUNTRY_FILTER=\"${MULLVAD_COUNTRY_FILTER}\"|"
+rotate_templated() {   # $1 = space-separated LAN subnets to keep off the tunnel
+    asset_rotate \
+        | sed "s|^COUNTRY_FILTER=.*|COUNTRY_FILTER=\"${MULLVAD_COUNTRY_FILTER}\"|" \
+        | sed "s|^LAN_SUBNETS=.*|LAN_SUBNETS=\"${1}\"|"
 }
 nft_templated() {   # $1 = LAN value for the nft `define LAN` line (e.g. "{ 192.168.1.0/24 }")
     asset_nft | sed "s|^define LAN = .*|define LAN = ${1}|"
 }
 
-# resolve_lan: echo the nft set of subnets to keep reachable for one guest —
-# the guest's own auto-detected LAN(s) plus any operator-specified extras,
-# falling back to the RFC1918 private ranges so a guest is never locked out.
-resolve_lan() {   # engine id
-    local detected="" extras="" all list
+# Union of every running guest's own LAN subnet(s), collected up-front by
+# collect_guest_lans() so each guest can be kept reachable to all the others.
+GUEST_LAN_SET=""
+
+# resolve_lan_list: echo a space-separated list of subnets to keep reachable for
+# one guest — the guest's own auto-detected LAN(s), every other running guest's
+# LAN(s) on the node, plus any operator-specified extras, falling back to the
+# RFC1918 private ranges so a guest is never locked out.
+resolve_lan_list() {   # engine id
+    local detected="" extras="" guests="" all
     if [[ "$MULLVAD_LAN_AUTODETECT" == "1" ]]; then
         detected="$(run_guest "$1" "$2" "$CMD_DETECT_LAN" 2>/dev/null | tr -d '\r')"
     fi
+    [[ "$MULLVAD_LAN_INCLUDE_GUESTS" == "1" ]] && guests="$GUEST_LAN_SET"
     extras="$(printf '%s' "$MULLVAD_LAN_SUBNET" | tr ',' ' ')"
     # normalise to one CIDR per line, keep only things that look like subnets, dedupe.
-    all="$(printf '%s %s\n' "$extras" "$detected" | tr ' ' '\n' | grep -E '/[0-9]+$' | sort -u || true)"
+    all="$(printf '%s %s %s\n' "$extras" "$detected" "$guests" | tr ' ' '\n' | grep -E '/[0-9]+$' | sort -u || true)"
     [[ -n "$all" ]] || all=$'10.0.0.0/8\n172.16.0.0/12\n192.168.0.0/16'
-    list="$(printf '%s\n' "$all" | paste -sd, - | sed 's/,/, /g')"
+    printf '%s' "$(printf '%s\n' "$all" | paste -sd' ' -)"
+}
+
+# lan_nft_set: turn a space-separated subnet list into an nft set literal,
+# e.g. "192.168.1.0/24 192.168.2.0/24" -> "{ 192.168.1.0/24, 192.168.2.0/24 }".
+lan_nft_set() {   # "a b c"
+    local list
+    list="$(printf '%s' "$1" | tr ' ' '\n' | grep -E '/[0-9]+$' | paste -sd, - | sed 's/,/, /g')"
     printf '{ %s }' "$list"
 }
 
@@ -369,12 +416,14 @@ deploy_killswitch() {   # engine id label
     run_guest "$engine" "$id" "$CMD_INSTALL_KS_DEPS" \
         || { log "  [$label] FAILED to install dependencies"; return 1; }
 
-    local lan_set; lan_set="$(resolve_lan "$engine" "$id")"
+    local lan_list lan_set
+    lan_list="$(resolve_lan_list "$engine" "$id")"
+    lan_set="$(lan_nft_set "$lan_list")"
     log "  [$label] LAN kept reachable: $lan_set"
 
     log "  [$label] pushing kill-switch assets"
-    rotate_templated            | push_file "$engine" "$id" /usr/local/bin/mullvad-rotate.sh 755 || return 1
-    nft_templated "$lan_set"    | push_file "$engine" "$id" /etc/nftables.d/mullvad-killswitch.nft 644 || return 1
+    rotate_templated "$lan_list"  | push_file "$engine" "$id" /usr/local/bin/mullvad-rotate.sh 755 || return 1
+    nft_templated "$lan_set"      | push_file "$engine" "$id" /etc/nftables.d/mullvad-killswitch.nft 644 || return 1
     asset_killswitch_service    | push_file "$engine" "$id" /etc/systemd/system/mullvad-killswitch.service 644 || return 1
     asset_healthcheck_service   | push_file "$engine" "$id" /etc/systemd/system/mullvad-healthcheck.service 644 || return 1
     asset_healthcheck_timer     | push_file "$engine" "$id" /etc/systemd/system/mullvad-healthcheck.timer 644 || return 1
@@ -488,12 +537,44 @@ process_vm() {
     fi
 }
 
+### ---- Cross-guest LAN discovery -------------------------------------------
+# collect_guest_lans: sweep every RUNNING guest once up-front and union their
+# directly-connected LAN subnet(s) into GUEST_LAN_SET, so resolve_lan() can keep
+# each guest reachable to all the other containers/VMs/LXCs on the LAN — not
+# just to its own subnet. Read-only (`ip route`), so it is safe in DRY_RUN too.
+collect_guest_lans() {
+    [[ "$MULLVAD_LAN_INCLUDE_GUESTS" == "1" ]] || return 0
+    local vmid status name detected subs=""
+
+    log "Pre-scan: collecting LAN subnets across all running guests ..."
+    while IFS=$'\t' read -r vmid status name; do
+        [[ "$status" == "running" ]] || continue
+        detected="$(run_guest lxc "$vmid" "$CMD_DETECT_LAN" 2>/dev/null | tr -d '\r')" || true
+        [[ -n "$detected" ]] && subs+=" $detected"
+    done < <(pvesh get "/nodes/$PVE_NODE/lxc" --output-format json | jq -r '.[] | [.vmid, .status, .name] | @tsv')
+
+    while IFS=$'\t' read -r vmid status name; do
+        [[ "$status" == "running" ]] || continue
+        vm_agent_ready "$vmid" || continue   # unreachable VMs are simply not counted
+        detected="$(run_guest vm "$vmid" "$CMD_DETECT_LAN" 2>/dev/null | tr -d '\r')" || true
+        [[ -n "$detected" ]] && subs+=" $detected"
+    done < <(pvesh get "/nodes/$PVE_NODE/qemu" --output-format json | jq -r '.[] | [.vmid, .status, .name] | @tsv')
+
+    GUEST_LAN_SET="$(printf '%s' "$subs" | tr ' ' '\n' | grep -E '/[0-9]+$' | sort -u | tr '\n' ' ')"
+    if [[ -n "$GUEST_LAN_SET" ]]; then
+        log "Pre-scan: guest LAN subnets kept reachable everywhere: ${GUEST_LAN_SET}"
+    else
+        log "Pre-scan: no guest LAN subnets detected"
+    fi
+}
+
 ### ---- Main -----------------------------------------------------------------
 main() {
     require_host_tools
 
     log "bulkvpn — Mullvad kill-switch bulk deploy"
     local lanmode; [[ "$MULLVAD_LAN_AUTODETECT" == "1" ]] && lanmode="auto${MULLVAD_LAN_SUBNET:+ +($MULLVAD_LAN_SUBNET)}" || lanmode="${MULLVAD_LAN_SUBNET:-RFC1918}"
+    [[ "$MULLVAD_LAN_INCLUDE_GUESTS" == "1" ]] && lanmode+=" +all-guests"
     log "Node: $PVE_NODE   LAN: $lanmode   Country: ${MULLVAD_COUNTRY_FILTER:-any}   Dry-run: $DRY"
     log "Log:  $LOG_FILE"
     log "----------------------------------------------------------------------"
@@ -503,6 +584,11 @@ main() {
         modprobe tun 2>/dev/null || log "WARN: could not modprobe tun on host"
         grep -qxF tun /etc/modules-load.d/tun.conf 2>/dev/null || echo tun >> /etc/modules-load.d/tun.conf 2>/dev/null || true
     fi
+
+    # Union every running guest's LAN subnet(s) first, so each guest's firewall
+    # can keep all the other containers/VMs/LXCs on the LAN reachable.
+    collect_guest_lans
+    log "----------------------------------------------------------------------"
 
     log "Scanning LXC containers on $PVE_NODE ..."
     while IFS=$'\t' read -r vmid status name; do
