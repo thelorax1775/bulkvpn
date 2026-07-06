@@ -35,6 +35,8 @@
 #   MULLVAD_COUNTRY_FILTER   limit rotation to a country (e.g. "USA"); default: any
 #   PVE_NODE                 Proxmox node to scan; default: `hostname -s`
 #   DRY_RUN                  1 = enumerate & classify only, change nothing
+#   FORCE_REDEPLOY           1 = re-push assets to every guest even if already
+#                            protected (use to roll out config/asset changes)
 #
 # Usage:  TS_AUTHKEY=tskey-... ./bulkvpn-deploy.sh [--help]
 # --------------------------------------------------------------------------
@@ -53,6 +55,7 @@ MULLVAD_LAN_SUBNET="${MULLVAD_LAN_SUBNET:-}"            # extra subnet(s) to alw
 MULLVAD_COUNTRY_FILTER="${MULLVAD_COUNTRY_FILTER:-}"
 PVE_NODE="${PVE_NODE:-$(hostname -s)}"
 DRY_RUN="${DRY_RUN:-0}"
+FORCE_REDEPLOY="${FORCE_REDEPLOY:-0}"   # 1 = re-push to already-protected guests too
 
 LXC_READY_TIMEOUT="${LXC_READY_TIMEOUT:-30}"
 VM_AGENT_TIMEOUT="${VM_AGENT_TIMEOUT:-90}"
@@ -62,7 +65,7 @@ LOG_FILE="/root/bulkvpn-$(date '+%Y%m%d-%H%M%S').log"
 
 SUCCESS=0; SKIPPED=0; FAILED=0
 
-usage() { sed -n '2,40p' "$0"; }
+usage() { sed -n '2,42p' "$0"; }
 [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage; exit 0; }
 
 # Mirror all output to a timestamped log.
@@ -72,7 +75,8 @@ log()  { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 inc()  { eval "$1=\$(( \${$1} + 1 ))"; }   # set -e-safe counter increment
 die()  { log "FATAL: $*"; exit 1; }
 
-DRY=false; [[ "$DRY_RUN" == "1" ]] && DRY=true
+DRY=false;   [[ "$DRY_RUN" == "1" ]] && DRY=true
+FORCE=false; [[ "$FORCE_REDEPLOY" == "1" ]] && FORCE=true
 
 ### ---- Embedded kill-switch assets ----------------------------------------
 # Single source of truth lives in assets/; these heredocs are kept identical
@@ -315,7 +319,10 @@ CMD_MULLVAD_AVAIL='tailscale exit-node list 2>/dev/null | grep -qi "mullvad.ts.n
 CMD_DETECT_LAN='ip -o -4 route show scope link 2>/dev/null | cut -d" " -f1 | grep "/" | grep -vE "^(127|169\.254|100)\." | sort -u | tr "\n" " "'
 CMD_INSTALL_TS="$GUEST_PM"'; command -v curl >/dev/null 2>&1 || pm_install curl ca-certificates; curl -fsSL https://tailscale.com/install.sh | sh'
 CMD_INSTALL_KS_DEPS="$GUEST_PM"'; command -v nft >/dev/null 2>&1 || pm_install nftables; command -v jq >/dev/null 2>&1 || pm_install jq; mkdir -p /etc/nftables.d /etc/systemd/system'
-CMD_ENABLE='systemctl daemon-reload && systemctl enable --now mullvad-killswitch.service && systemctl enable --now mullvad-healthcheck.timer'
+# Use restart (not just enable --now) so a re-push actually reloads the freshly
+# templated nft ruleset / units — enable --now is a no-op on an already-active
+# oneshot service and would leave the old LAN set loaded in the kernel.
+CMD_ENABLE='systemctl daemon-reload && systemctl enable mullvad-killswitch.service && systemctl restart mullvad-killswitch.service && systemctl enable mullvad-healthcheck.timer && systemctl restart mullvad-healthcheck.timer'
 CMD_KICK='/usr/local/bin/mullvad-rotate.sh'
 CMD_VERIFY='test -x /usr/local/bin/mullvad-rotate.sh && systemctl is-active --quiet mullvad-healthcheck.timer && nft list table inet mullvad_killswitch >/dev/null 2>&1'
 
@@ -449,7 +456,10 @@ process_lxc() {
     log "LXC $label"
 
     if run_guest lxc "$vmid" "$CMD_PROTECTED"; then
-        log "  [$label] SKIP — kill-switch already installed & scheduled"; inc SKIPPED; return 0
+        if ! $FORCE; then
+            log "  [$label] SKIP — kill-switch already installed & scheduled (set FORCE_REDEPLOY=1 to re-push)"; inc SKIPPED; return 0
+        fi
+        log "  [$label] FORCE_REDEPLOY — re-pushing assets to already-protected guest"
     fi
     if ! run_guest lxc "$vmid" "$CMD_HAS_SYSTEMD"; then
         log "  [$label] SKIP — guest is not systemd-based"; inc SKIPPED; return 0
@@ -502,7 +512,10 @@ process_vm() {
         log "  [$label] SKIP — qemu-guest-agent not responding (install & start it in the guest)"; inc SKIPPED; return 0
     fi
     if run_guest vm "$vmid" "$CMD_PROTECTED"; then
-        log "  [$label] SKIP — kill-switch already installed & scheduled"; inc SKIPPED; return 0
+        if ! $FORCE; then
+            log "  [$label] SKIP — kill-switch already installed & scheduled (set FORCE_REDEPLOY=1 to re-push)"; inc SKIPPED; return 0
+        fi
+        log "  [$label] FORCE_REDEPLOY — re-pushing assets to already-protected guest"
     fi
     if ! run_guest vm "$vmid" "$CMD_HAS_SYSTEMD"; then
         log "  [$label] SKIP — guest is not systemd-based"; inc SKIPPED; return 0
@@ -575,7 +588,7 @@ main() {
     log "bulkvpn — Mullvad kill-switch bulk deploy"
     local lanmode; [[ "$MULLVAD_LAN_AUTODETECT" == "1" ]] && lanmode="auto${MULLVAD_LAN_SUBNET:+ +($MULLVAD_LAN_SUBNET)}" || lanmode="${MULLVAD_LAN_SUBNET:-RFC1918}"
     [[ "$MULLVAD_LAN_INCLUDE_GUESTS" == "1" ]] && lanmode+=" +all-guests"
-    log "Node: $PVE_NODE   LAN: $lanmode   Country: ${MULLVAD_COUNTRY_FILTER:-any}   Dry-run: $DRY"
+    log "Node: $PVE_NODE   LAN: $lanmode   Country: ${MULLVAD_COUNTRY_FILTER:-any}   Dry-run: $DRY   Force-redeploy: $FORCE"
     log "Log:  $LOG_FILE"
     log "----------------------------------------------------------------------"
 
