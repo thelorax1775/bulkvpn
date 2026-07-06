@@ -288,6 +288,12 @@ build_up_cmd() {   # $1 hostname -> echoes the in-guest `tailscale up ...` comma
     cmd="tailscale up --authkey='${TS_AUTHKEY}' --hostname='${host}'"
     [[ -n "$TS_LOGIN_SERVER" ]] && cmd+=" --login-server='${TS_LOGIN_SERVER}'"
     [[ -n "$TS_EXTRA_ARGS"   ]] && cmd+=" ${TS_EXTRA_ARGS}"
+    # If an exit node is used at enrollment (e.g. pinned via TS_EXTRA_ARGS),
+    # allow direct LAN access automatically so we don't lose the web UI / SSH
+    # to the tunnel before the first rotation. Skip if the caller set it.
+    if [[ "$cmd" == *--exit-node* && "$cmd" != *--exit-node-allow-lan-access* ]]; then
+        cmd+=" --exit-node-allow-lan-access=true"
+    fi
     printf '%s' "$cmd"
 }
 
