@@ -1,0 +1,3 @@
+# Runtime logs written by bulkvpn-deploy.sh
+bulkvpn-*.log
+*.log

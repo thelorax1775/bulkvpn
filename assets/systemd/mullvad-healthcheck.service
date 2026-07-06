@@ -1,0 +1,8 @@
+[Unit]
+Description=Self-heal Tailscale/Mullvad exit node if connectivity is down
+After=tailscaled.service mullvad-killswitch.service
+Wants=tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mullvad-rotate.sh --check-only

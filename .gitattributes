@@ -1,0 +1,9 @@
+# These are Linux scripts/config — always store and check out with LF endings,
+# regardless of the contributor's core.autocrlf setting. A CRLF shebang or
+# systemd unit will not run on the target guests.
+*.sh            text eol=lf
+*.nft           text eol=lf
+*.service       text eol=lf
+*.timer         text eol=lf
+bulkvpn-deploy.sh text eol=lf
+* text=auto

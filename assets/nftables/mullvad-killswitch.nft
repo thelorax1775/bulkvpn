@@ -1,0 +1,44 @@
+#!/usr/sbin/nft -f
+#
+# mullvad-killswitch.nft — fail-closed egress firewall for the Tailscale +
+# Mullvad exit-node setup.
+#
+# While a working exit node is up, app traffic egresses via tailscale0 and
+# tailscaled's encrypted underlay is allowed out the physical NIC. If the exit
+# node drops or is unset, EVERYTHING else is dropped — your real IP never leaks.
+#
+# Reload idempotently with:  nft -f /etc/nftables.d/mullvad-killswitch.nft
+#
+# Adjust LAN to match your local subnet if it isn't 192.168.1.0/24.
+# (bulkvpn-deploy.sh templates this line from MULLVAD_LAN_SUBNET.)
+
+define LAN = 192.168.1.0/24
+
+add table inet mullvad_killswitch
+delete table inet mullvad_killswitch
+table inet mullvad_killswitch {
+    chain output {
+        type filter hook output priority 0; policy drop;
+
+        # Loopback and already-established/related flows.
+        oif "lo" accept
+        ct state established,related accept
+
+        # App traffic that has been routed into the Tailscale tunnel.
+        oifname "tailscale0" accept
+
+        # Tailscale's own encrypted underlay (WireGuard/DERP) carries the
+        # bypass mark 0x80000, so it isn't re-routed into the tunnel. Allow it,
+        # otherwise tailscaled can't reach the exit node at all.
+        meta mark and 0xff0000 == 0x80000 accept
+
+        # Local network: keep the qBittorrent web UI / SSH reachable from LAN.
+        ip daddr $LAN accept
+
+        # DHCP renew (harmless if you use a static IP).
+        udp dport 67 accept
+
+        # Everything else — raw internet egress over the physical NIC — is
+        # dropped by the chain policy. That is the leak protection.
+    }
+}
