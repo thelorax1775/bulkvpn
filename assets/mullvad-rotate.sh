@@ -16,13 +16,17 @@
 # your real IP.
 #
 # Vendored from https://github.com/thelorax1775/tailscale-mullvad-killswitch
-# The COUNTRY_FILTER / ALLOW_LAN lines below are templated by bulkvpn-deploy.sh.
+# The COUNTRY_FILTER / ALLOW_LAN / LAN_SUBNETS lines below are templated by
+# bulkvpn-deploy.sh.
 
 set -euo pipefail
 
 ### ---- Configuration -------------------------------------------------------
 COUNTRY_FILTER=""              # e.g. "USA"; empty = any country
 ALLOW_LAN=true                 # keep LAN access to the web UI / SSH
+LAN_SUBNETS=""                 # space-separated CIDRs to keep reachable directly
+                               # (off the exit-node tunnel), e.g. other guests' LANs
+LAN_BYPASS_PRIO=5200           # ip-rule priority (above Tailscale's ~5230 diverter)
 LOG_FILE="/var/log/mullvad-rotate.log"
 CHECK_TIMEOUT=8                # seconds per connectivity probe
 TUNNEL_SETTLE=3                # seconds to wait after switching before probing
@@ -36,6 +40,31 @@ log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FIL
 die() { log "ERROR: $*"; exit 1; }
 
 [[ -x "$TAILSCALE" ]] || die "tailscale binary not found at '$TAILSCALE'"
+
+# ensure_lan_bypass: keep the configured LAN subnets reachable *directly* while
+# an exit node is active. Tailscale policy-routes the default route into the
+# tunnel (ip rule at priority ~5230), which otherwise swallows traffic to other
+# LAN subnets reached via the gateway (--exit-node-allow-lan-access only exempts
+# the node's own directly-connected subnet). A higher-priority rule sends these
+# subnets to the main table so they egress via the local gateway instead of the
+# tunnel — so containers/VMs/LXCs on the LAN can still reach each other. These
+# rules are runtime-only, so re-assert them on every run (idempotent).
+ensure_lan_bypass() {
+    [[ -n "$LAN_SUBNETS" ]] || return 0
+    command -v ip >/dev/null 2>&1 || return 0
+    local net
+    for net in $LAN_SUBNETS; do
+        [[ "$net" == */* ]] || continue
+        ip rule del to "$net" lookup main priority "$LAN_BYPASS_PRIO" 2>/dev/null || true
+        if ip rule add to "$net" lookup main priority "$LAN_BYPASS_PRIO" 2>/dev/null; then
+            log "LAN bypass: $net -> main table (direct, off tunnel)"
+        fi
+    done
+}
+
+# Keep the LAN reachable before anything else, on every run (including
+# --check-only heals), so a reboot that comes up healthy still restores it.
+ensure_lan_bypass
 
 verify_connectivity() {
     # With the kill-switch active, ANY successful outbound TCP connect proves
