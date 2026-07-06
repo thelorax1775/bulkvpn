@@ -39,18 +39,20 @@ enumerate running LXC + VMs on the node
 
 ## Usage
 
+Run it directly on the Proxmox host as `root` (no `sudo` needed):
+
 ```bash
 # minimum: a Tailscale auth key
-sudo TS_AUTHKEY=tskey-auth-xxxxxxdeploy ./bulkvpn-deploy.sh
+TS_AUTHKEY=tskey-auth-xxxxxxdeploy ./bulkvpn-deploy.sh
 
 # see what it would do, change nothing
-sudo DRY_RUN=1 TS_AUTHKEY=tskey-... ./bulkvpn-deploy.sh
+DRY_RUN=1 TS_AUTHKEY=tskey-... ./bulkvpn-deploy.sh
 
 # match your real management LAN, pin exit nodes to a country
-sudo TS_AUTHKEY=tskey-... \
-     MULLVAD_LAN_SUBNET=10.0.10.0/24 \
-     MULLVAD_COUNTRY_FILTER=USA \
-     ./bulkvpn-deploy.sh
+TS_AUTHKEY=tskey-... \
+  MULLVAD_LAN_SUBNET=10.0.10.0/24 \
+  MULLVAD_COUNTRY_FILTER=USA \
+  ./bulkvpn-deploy.sh
 ```
 
 ### Configuration (environment variables)
@@ -72,7 +74,7 @@ Every run writes a timestamped log to `/root/bulkvpn-<timestamp>.log` and prints
 
 - `mullvad-killswitch.service` loads an nftables `output` chain with a default `drop` policy at boot. Only loopback, established/related flows, the `tailscale0` tunnel, Tailscale's marked underlay (`0x80000`), your LAN, and DHCP are allowed — everything else is dropped, so a dropped exit node never leaks your real IP.
 - `mullvad-healthcheck.timer` runs `mullvad-rotate.sh --check-only` 2 minutes after boot and every 15 minutes, re-acquiring a working Mullvad exit node whenever connectivity is down.
-- Manual controls inside a guest: `sudo mullvad-rotate.sh` (rotate now), `systemctl status mullvad-healthcheck.timer`, `tail -f /var/log/mullvad-rotate.log`.
+- Manual controls inside a guest (as root): `mullvad-rotate.sh` (rotate now), `systemctl status mullvad-healthcheck.timer`, `tail -f /var/log/mullvad-rotate.log`.
 
 ## Caveats
 
