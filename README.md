@@ -55,7 +55,25 @@ TS_AUTHKEY=tskey-... \
   MULLVAD_COUNTRY_FILTER=USA \
   MULLVAD_LAN_SUBNET=10.0.10.0/24 \
   ./bulkvpn-deploy.sh
+
+# re-run on the same node to roll out an updated ruleset / config to guests
+# that were already protected by an earlier run
+FORCE_REDEPLOY=1 TS_AUTHKEY=tskey-... ./bulkvpn-deploy.sh
 ```
+
+### Re-running on the same node
+
+Re-runs are **idempotent**: by default a guest that's already protected (rotate
+script present + kill-switch service enabled + self-heal timer active) is
+**skipped** and left untouched — so a plain re-run does *not* re-push assets or
+pick up config/asset changes on guests deployed by an earlier run. To roll out a
+new ruleset or changed settings (for example this LAN-reachability update) to
+guests you've already deployed to, run with `FORCE_REDEPLOY=1`: it re-pushes
+every asset, reloads the nft ruleset (via `systemctl restart`, so the new LAN set
+actually takes effect — `enable --now` alone is a no-op on an already-active
+oneshot service), and kicks a fresh rotation that re-asserts the LAN bypass
+routes. Brand-new / unprotected guests are deployed the same way with or without
+the flag.
 
 By default each guest's own LAN subnet is **auto-detected and kept reachable**, so SSH / web UIs stay up without you having to specify anything. On top of that, every other running container / VM / LXC's LAN subnet on the node is collected up-front and allowed on **every** guest, so guests stay reachable to each other on the same LAN subnet(s) they were on before the kill-switch was applied. Set `MULLVAD_LAN_INCLUDE_GUESTS=0` to keep only each guest's own subnet.
 
@@ -73,6 +91,7 @@ By default each guest's own LAN subnet is **auto-detected and kept reachable**, 
 | `MULLVAD_COUNTRY_FILTER` | *(any)* | Restrict exit-node rotation to a country (e.g. `USA`) |
 | `PVE_NODE` | `hostname -s` | Proxmox node to scan |
 | `DRY_RUN` | `0` | `1` = enumerate & classify only, deploy nothing |
+| `FORCE_REDEPLOY` | `0` | `1` = re-push assets and reload the ruleset on **already-protected** guests too (use to roll out config/asset changes to guests deployed by an earlier run) |
 
 Every run writes a timestamped log to `/root/bulkvpn-<timestamp>.log` and prints a `SUCCESS / SKIPPED / FAILED` tally.
 
