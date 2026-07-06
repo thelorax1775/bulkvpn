@@ -48,12 +48,15 @@ TS_AUTHKEY=tskey-auth-xxxxxxdeploy ./bulkvpn-deploy.sh
 # see what it would do, change nothing
 DRY_RUN=1 TS_AUTHKEY=tskey-... ./bulkvpn-deploy.sh
 
-# match your real management LAN, pin exit nodes to a country
+# pin exit nodes to a country; also allow an extra subnet on top of the
+# auto-detected LAN (e.g. a separate management VLAN)
 TS_AUTHKEY=tskey-... \
-  MULLVAD_LAN_SUBNET=10.0.10.0/24 \
   MULLVAD_COUNTRY_FILTER=USA \
+  MULLVAD_LAN_SUBNET=10.0.10.0/24 \
   ./bulkvpn-deploy.sh
 ```
+
+By default each guest's own LAN subnet is **auto-detected and kept reachable**, so SSH / web UIs stay up without you having to specify anything.
 
 ### Configuration (environment variables)
 
@@ -63,7 +66,8 @@ TS_AUTHKEY=tskey-... \
 | `TS_LOGIN_SERVER` | *(none)* | Alternative control server (e.g. Headscale) |
 | `TS_HOSTNAME_PREFIX` | `ct-` (LXC) / `vm-` (VM) | Prefix for each guest's tailnet hostname |
 | `TS_EXTRA_ARGS` | *(none)* | Extra flags appended to every `tailscale up` |
-| `MULLVAD_LAN_SUBNET` | `192.168.1.0/24` | LAN the firewall keeps reachable (SSH / web UIs). **Set this to your real LAN.** |
+| `MULLVAD_LAN_AUTODETECT` | `1` | Auto-detect and allow each guest's own LAN subnet(s). `0` = don't. |
+| `MULLVAD_LAN_SUBNET` | *(none)* | Extra subnet(s) to always allow, on top of auto-detect (space/comma separated) |
 | `MULLVAD_COUNTRY_FILTER` | *(any)* | Restrict exit-node rotation to a country (e.g. `USA`) |
 | `PVE_NODE` | `hostname -s` | Proxmox node to scan |
 | `DRY_RUN` | `0` | `1` = enumerate & classify only, deploy nothing |
@@ -78,7 +82,7 @@ Every run writes a timestamped log to `/root/bulkvpn-<timestamp>.log` and prints
 
 ## Caveats
 
-- **Set `MULLVAD_LAN_SUBNET` to your real management LAN.** The firewall only keeps that subnet reachable; a wrong value can lock you out of a guest's SSH/web UI (raw egress is dropped). The default is `192.168.1.0/24`.
+- **LAN access is automatic.** Each guest's own directly-connected LAN subnet(s) are auto-detected (from its link routes, excluding loopback / link-local / the Tailscale CGNAT range) and allowed by the firewall, so SSH / web UIs stay reachable without configuration. If nothing is detectable the firewall falls back to the private RFC1918 ranges (never locks you out). Set `MULLVAD_LAN_SUBNET` to add extra subnets (e.g. a separate management VLAN), or `MULLVAD_LAN_AUTODETECT=0` to allow *only* what you list.
 - **Fail-closed ordering is enforced.** Tailscale + a visible Mullvad exit node are verified *before* the drop-policy firewall is loaded. A guest with no Mullvad exit node visible on the tailnet is **skipped** and left untouched rather than cut off — the kill-switch is only ever deployed where there's an endpoint to protect with.
 - **nftables in LXC:** privileged containers work cleanly; unprivileged containers run the firewall in their own netns and usually work, but `/dev/net/tun` passthrough for Tailscale is more reliable in a privileged CT (a warning is logged).
 - **systemd only.** The kill-switch ships as systemd units; non-systemd guests (Alpine/OpenRC, etc.) are detected and skipped.

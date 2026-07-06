@@ -27,7 +27,8 @@
 #   TS_LOGIN_SERVER          alt control server (e.g. Headscale); default: none
 #   TS_HOSTNAME_PREFIX       hostname prefix; default: "ct-" (LXC) / "vm-" (VM)
 #   TS_EXTRA_ARGS            extra flags appended to every `tailscale up`
-#   MULLVAD_LAN_SUBNET       LAN allowed by the firewall; default 192.168.1.0/24
+#   MULLVAD_LAN_AUTODETECT   1 (default) = auto-allow each guest's own LAN subnet(s)
+#   MULLVAD_LAN_SUBNET       extra subnet(s) to always allow (space/comma sep); default: none
 #   MULLVAD_COUNTRY_FILTER   limit rotation to a country (e.g. "USA"); default: any
 #   PVE_NODE                 Proxmox node to scan; default: `hostname -s`
 #   DRY_RUN                  1 = enumerate & classify only, change nothing
@@ -43,7 +44,8 @@ TS_LOGIN_SERVER="${TS_LOGIN_SERVER:-}"
 TS_HOSTNAME_PREFIX_LXC="${TS_HOSTNAME_PREFIX:-ct-}"
 TS_HOSTNAME_PREFIX_VM="${TS_HOSTNAME_PREFIX:-vm-}"
 TS_EXTRA_ARGS="${TS_EXTRA_ARGS:-}"
-MULLVAD_LAN_SUBNET="${MULLVAD_LAN_SUBNET:-192.168.1.0/24}"
+MULLVAD_LAN_AUTODETECT="${MULLVAD_LAN_AUTODETECT:-1}"   # 1 = auto-allow each guest's own LAN
+MULLVAD_LAN_SUBNET="${MULLVAD_LAN_SUBNET:-}"            # extra subnet(s) to always allow (space/comma sep)
 MULLVAD_COUNTRY_FILTER="${MULLVAD_COUNTRY_FILTER:-}"
 PVE_NODE="${PVE_NODE:-$(hostname -s)}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -234,8 +236,24 @@ HT_EOF
 rotate_templated() {
     asset_rotate | sed "s|^COUNTRY_FILTER=.*|COUNTRY_FILTER=\"${MULLVAD_COUNTRY_FILTER}\"|"
 }
-nft_templated() {
-    asset_nft | sed "s|^define LAN = .*|define LAN = ${MULLVAD_LAN_SUBNET}|"
+nft_templated() {   # $1 = LAN value for the nft `define LAN` line (e.g. "{ 192.168.1.0/24 }")
+    asset_nft | sed "s|^define LAN = .*|define LAN = ${1}|"
+}
+
+# resolve_lan: echo the nft set of subnets to keep reachable for one guest —
+# the guest's own auto-detected LAN(s) plus any operator-specified extras,
+# falling back to the RFC1918 private ranges so a guest is never locked out.
+resolve_lan() {   # engine id
+    local detected="" extras="" all list
+    if [[ "$MULLVAD_LAN_AUTODETECT" == "1" ]]; then
+        detected="$(run_guest "$1" "$2" "$CMD_DETECT_LAN" 2>/dev/null | tr -d '\r')"
+    fi
+    extras="$(printf '%s' "$MULLVAD_LAN_SUBNET" | tr ',' ' ')"
+    # normalise to one CIDR per line, keep only things that look like subnets, dedupe.
+    all="$(printf '%s %s\n' "$extras" "$detected" | tr ' ' '\n' | grep -E '/[0-9]+$' | sort -u || true)"
+    [[ -n "$all" ]] || all=$'10.0.0.0/8\n172.16.0.0/12\n192.168.0.0/16'
+    list="$(printf '%s\n' "$all" | paste -sd, - | sed 's/,/, /g')"
+    printf '{ %s }' "$list"
 }
 
 ### ---- In-guest command snippets ------------------------------------------
@@ -245,6 +263,9 @@ CMD_HAS_SYSTEMD='test -d /run/systemd/system'
 CMD_TS_ACTIVE='command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1 && tailscale status 2>/dev/null | grep -q "100\."'
 CMD_PROTECTED='test -x /usr/local/bin/mullvad-rotate.sh && systemctl is-enabled --quiet mullvad-killswitch.service && systemctl is-active --quiet mullvad-healthcheck.timer'
 CMD_MULLVAD_AVAIL='tailscale exit-node list 2>/dev/null | grep -qi "mullvad.ts.net"'
+# Print the guest's own directly-connected IPv4 LAN subnet(s), excluding
+# loopback, link-local, and the Tailscale CGNAT range (100.64.0.0/10).
+CMD_DETECT_LAN='ip -o -4 route show scope link 2>/dev/null | cut -d" " -f1 | grep "/" | grep -vE "^(127|169\.254|100)\." | sort -u | tr "\n" " "'
 CMD_INSTALL_TS="$GUEST_PM"'; command -v curl >/dev/null 2>&1 || pm_install curl ca-certificates; curl -fsSL https://tailscale.com/install.sh | sh'
 CMD_INSTALL_KS_DEPS="$GUEST_PM"'; command -v nft >/dev/null 2>&1 || pm_install nftables; command -v jq >/dev/null 2>&1 || pm_install jq; mkdir -p /etc/nftables.d /etc/systemd/system'
 CMD_ENABLE='systemctl daemon-reload && systemctl enable --now mullvad-killswitch.service && systemctl enable --now mullvad-healthcheck.timer'
@@ -342,9 +363,12 @@ deploy_killswitch() {   # engine id label
     run_guest "$engine" "$id" "$CMD_INSTALL_KS_DEPS" \
         || { log "  [$label] FAILED to install dependencies"; return 1; }
 
+    local lan_set; lan_set="$(resolve_lan "$engine" "$id")"
+    log "  [$label] LAN kept reachable: $lan_set"
+
     log "  [$label] pushing kill-switch assets"
     rotate_templated            | push_file "$engine" "$id" /usr/local/bin/mullvad-rotate.sh 755 || return 1
-    nft_templated               | push_file "$engine" "$id" /etc/nftables.d/mullvad-killswitch.nft 644 || return 1
+    nft_templated "$lan_set"    | push_file "$engine" "$id" /etc/nftables.d/mullvad-killswitch.nft 644 || return 1
     asset_killswitch_service    | push_file "$engine" "$id" /etc/systemd/system/mullvad-killswitch.service 644 || return 1
     asset_healthcheck_service   | push_file "$engine" "$id" /etc/systemd/system/mullvad-healthcheck.service 644 || return 1
     asset_healthcheck_timer     | push_file "$engine" "$id" /etc/systemd/system/mullvad-healthcheck.timer 644 || return 1
@@ -463,7 +487,8 @@ main() {
     require_host_tools
 
     log "bulkvpn — Mullvad kill-switch bulk deploy"
-    log "Node: $PVE_NODE   LAN: $MULLVAD_LAN_SUBNET   Country: ${MULLVAD_COUNTRY_FILTER:-any}   Dry-run: $DRY"
+    local lanmode; [[ "$MULLVAD_LAN_AUTODETECT" == "1" ]] && lanmode="auto${MULLVAD_LAN_SUBNET:+ +($MULLVAD_LAN_SUBNET)}" || lanmode="${MULLVAD_LAN_SUBNET:-RFC1918}"
+    log "Node: $PVE_NODE   LAN: $lanmode   Country: ${MULLVAD_COUNTRY_FILTER:-any}   Dry-run: $DRY"
     log "Log:  $LOG_FILE"
     log "----------------------------------------------------------------------"
 
