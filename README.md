@@ -125,6 +125,110 @@ assets/
 
 The `assets/` files are the single source of truth (vendored verbatim from the upstream kill-switch repo). `bulkvpn-deploy.sh` embeds identical copies inline so it can provision guests without fetching anything — handy since the kill-switch itself blocks egress. If you edit an asset, mirror the change into the matching `asset_*()` heredoc in the script.
 
+## Removing bulkvpn from individual guests
+
+Deployment is idempotent, but there is no built-in *removal* — a guest stays
+protected until you tear the kill-switch off it by hand. This section covers
+peeling it back off one guest, or off several from the host, without touching
+the guests you want to keep protected.
+
+> **Order matters.** The firewall is fail-closed, so you **open egress before
+> clearing the exit node** — otherwise the guest loses WAN the moment the exit
+> node goes away but the drop-policy table is still loaded. The sequence below
+> is already in the safe order.
+
+> **If a guest is unreachable over the network**, don't rely on SSH — get in
+> from the Proxmox host instead. For an LXC: `pct enter <ctid>`. For a VM: the
+> noVNC console in the PVE web UI, or `qm terminal <vmid>`. Neither path
+> traverses the guest's own networking, so a bad firewall state can't lock you
+> out of the teardown.
+
+### On a single guest (run as root inside the guest)
+
+```bash
+# 1. stop the self-healer + firewall so nothing re-asserts mid-teardown
+systemctl disable --now mullvad-healthcheck.timer mullvad-healthcheck.service mullvad-killswitch.service 2>/dev/null
+
+# 2. drop the fail-closed nft table -> egress open again (BEFORE clearing the exit node)
+nft list tables | grep -i mullvad | while read _ fam name; do nft delete table $fam $name; done
+
+# 3. clear the Mullvad exit node
+tailscale set --exit-node= --exit-node-allow-lan-access=false
+
+# 4. remove the runtime policy-routing rules the rotator installs (priority 5200)
+while ip rule show | grep -q "^5200:"; do ip rule del priority 5200; done
+
+# 5. delete the deployed assets + units
+rm -f /usr/local/bin/mullvad-rotate.sh /var/log/mullvad-rotate.log
+rm -f /etc/systemd/system/mullvad-killswitch.service \
+      /etc/systemd/system/mullvad-healthcheck.service \
+      /etc/systemd/system/mullvad-healthcheck.timer
+systemctl daemon-reload
+```
+
+Step 1 is the important one: disabling `mullvad-healthcheck.timer` is what stops
+the 15-minute rotator from re-pinning an exit node the moment you clear it.
+Removing the unit files (step 5) is what keeps it from coming back on the next
+reboot. Tailscale itself is left up and enrolled — only the Mullvad exit-node
+routing and the kill-switch are removed.
+
+### From the Proxmox host (per guest, no guest shell needed)
+
+**LXC** — driven with `pct exec`, same mechanics the deploy script uses:
+
+```bash
+CTID=102
+pct exec "$CTID" -- bash -c '
+  systemctl disable --now mullvad-healthcheck.timer mullvad-healthcheck.service mullvad-killswitch.service 2>/dev/null
+  nft list tables | grep -i mullvad | while read _ fam name; do nft delete table $fam $name; done
+  tailscale set --exit-node= --exit-node-allow-lan-access=false
+  while ip rule show | grep -q "^5200:"; do ip rule del priority 5200; done
+  rm -f /usr/local/bin/mullvad-rotate.sh /var/log/mullvad-rotate.log \
+        /etc/systemd/system/mullvad-killswitch.service \
+        /etc/systemd/system/mullvad-healthcheck.{service,timer}
+  systemctl daemon-reload
+'
+```
+
+**VM** — via the QEMU guest agent (the VM needs `qemu-guest-agent` running, same
+as at deploy time):
+
+```bash
+VMID=201
+qm guest exec "$VMID" -- bash -c '
+  systemctl disable --now mullvad-healthcheck.timer mullvad-healthcheck.service mullvad-killswitch.service 2>/dev/null
+  nft list tables | grep -i mullvad | while read _ fam name; do nft delete table $fam $name; done
+  tailscale set --exit-node= --exit-node-allow-lan-access=false
+  while ip rule show | grep -q "^5200:"; do ip rule del priority 5200; done
+  rm -f /usr/local/bin/mullvad-rotate.sh /var/log/mullvad-rotate.log \
+        /etc/systemd/system/mullvad-killswitch.service \
+        /etc/systemd/system/mullvad-healthcheck.{service,timer}
+  systemctl daemon-reload
+'
+```
+
+### Verifying the guest is clean
+
+```bash
+tailscale status | grep -i "exit node"        # no exit node -> returns nothing
+ping -c3 8.8.8.8                               # back to normal WAN latency
+curl -s https://am.i.mullvad.net/connected     # should report you are NOT connected via Mullvad
+```
+
+For a service with a web UI, also load it from another LAN box (not from inside
+the guest) to confirm the earlier drop-policy isn't still blackholing LAN
+replies — an in-guest `curl` to localhost will return `200` even while the
+firewall is dropping traffic to other hosts.
+
+### Note: a torn-down guest becomes a redeploy target
+
+Deployment skips guests that are *already protected* and deploys to ones that
+aren't. Once you tear the kill-switch off a guest, it counts as unprotected
+again — so the **next plain run of `bulkvpn-deploy.sh` will redeploy to it.**
+There is currently no deploy-time exclude list, so if you want a guest to stay
+permanently unprotected, either don't re-run the deploy against that node, or
+add an exclusion (see below).
+
 ## Credits & license
 
 Kill-switch design and the vendored `assets/` files are from [tailscale-mullvad-killswitch](https://github.com/thelorax1775/tailscale-mullvad-killswitch); the bulk Proxmox deployment pattern is from [TailAdjuster](https://github.com/thelorax1775/TailAdjuster), both by [@thelorax1775](https://github.com/thelorax1775). Licensed under Apache-2.0 — see [LICENSE](LICENSE).
