@@ -49,6 +49,15 @@ TS_AUTHKEY=tskey-auth-xxxxxxdeploy ./bulkvpn-deploy.sh
 # see what it would do, change nothing
 DRY_RUN=1 TS_AUTHKEY=tskey-... ./bulkvpn-deploy.sh
 
+# pick which guests to deploy to: on a terminal you get an interactive
+# checklist (whiptail) of the running containers/VMs; toggle with Space, Enter
+# confirms. All are pre-checked, so plain Enter = every running guest.
+TS_AUTHKEY=tskey-... ./bulkvpn-deploy.sh
+
+# or name the guests up-front (skips the menu — good for automation): a
+# space/comma-separated list of vmids
+SELECT_GUESTS="101 102 205" TS_AUTHKEY=tskey-... ./bulkvpn-deploy.sh
+
 # pin exit nodes to a country; also allow an extra subnet on top of the
 # auto-detected LAN (e.g. a separate management VLAN)
 TS_AUTHKEY=tskey-... \
@@ -60,6 +69,26 @@ TS_AUTHKEY=tskey-... \
 # that were already protected by an earlier run
 FORCE_REDEPLOY=1 TS_AUTHKEY=tskey-... ./bulkvpn-deploy.sh
 ```
+
+### Choosing which guests get the kill-switch
+
+By default the deploy targets **every running** container and VM on the node.
+To pick a subset:
+
+- **Interactively**: run it from a terminal without setting `SELECT_GUESTS` and
+  you get a `whiptail` checklist of the running guests (Space toggles, Enter
+  confirms). Everything is pre-checked, so a plain Enter keeps the deploy-to-all
+  behavior. If `whiptail` isn't installed it falls back to a numbered text
+  prompt. Cancel / an empty selection deploys to nothing.
+- **Non-interactively**: set `SELECT_GUESTS` to a space/comma-separated list of
+  vmids (e.g. `SELECT_GUESTS="101 102 205"`) to skip the menu — ideal for
+  automation. Unknown or stopped ids are warned about and ignored. When
+  `SELECT_GUESTS` is unset **and** there's no terminal (cron, a pipe), it deploys
+  to every running guest, exactly as before.
+
+The selection only controls *which guests get the kill-switch installed* — the
+cross-guest LAN pre-scan still sweeps every running guest, so a protected guest
+stays reachable to all the others on the LAN, selected or not.
 
 ### Re-running on the same node
 
@@ -90,6 +119,7 @@ By default each guest's own LAN subnet is **auto-detected and kept reachable**, 
 | `MULLVAD_LAN_SUBNET` | *(none)* | Extra subnet(s) to always allow, on top of auto-detect (space/comma separated) |
 | `MULLVAD_COUNTRY_FILTER` | *(any)* | Restrict exit-node rotation to a country (e.g. `USA`) |
 | `PVE_NODE` | `hostname -s` | Proxmox node to scan |
+| `SELECT_GUESTS` | *(unset)* | Space/comma-separated vmids to deploy to. Unset + a terminal → an interactive checklist to pick running guests; unset + no terminal (cron/pipe) → every running guest (the historical default). |
 | `DRY_RUN` | `0` | `1` = enumerate & classify only, deploy nothing |
 | `FORCE_REDEPLOY` | `0` | `1` = re-push assets and reload the ruleset on **already-protected** guests too (use to roll out config/asset changes to guests deployed by an earlier run) |
 
@@ -225,9 +255,9 @@ firewall is dropping traffic to other hosts.
 Deployment skips guests that are *already protected* and deploys to ones that
 aren't. Once you tear the kill-switch off a guest, it counts as unprotected
 again — so the **next plain run of `bulkvpn-deploy.sh` will redeploy to it.**
-There is currently no deploy-time exclude list, so if you want a guest to stay
-permanently unprotected, either don't re-run the deploy against that node, or
-add an exclusion (see below).
+If you want a guest to stay unprotected on a given run, leave it unchecked in
+the interactive menu, or list only the guests you *do* want via `SELECT_GUESTS`
+(see [Choosing which guests get the kill-switch](#choosing-which-guests-get-the-kill-switch)).
 
 ## Credits & license
 
