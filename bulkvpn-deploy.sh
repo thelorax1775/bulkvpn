@@ -34,6 +34,12 @@
 #   MULLVAD_LAN_SUBNET       extra subnet(s) to always allow (space/comma sep); default: none
 #   MULLVAD_COUNTRY_FILTER   limit rotation to a country (e.g. "USA"); default: any
 #   PVE_NODE                 Proxmox node to scan; default: `hostname -s`
+#   SELECT_GUESTS            space/comma-separated vmids to deploy to; default:
+#                            unset. When unset and a terminal is attached, an
+#                            interactive checklist (whiptail, or a numbered text
+#                            prompt fallback) lets you pick which running guests
+#                            get the kill-switch. When unset with no terminal
+#                            (cron/pipe), every running guest is selected.
 #   DRY_RUN                  1 = enumerate & classify only, change nothing
 #   FORCE_REDEPLOY           1 = re-push assets to every guest even if already
 #                            protected (use to roll out config/asset changes)
@@ -54,6 +60,7 @@ MULLVAD_LAN_INCLUDE_GUESTS="${MULLVAD_LAN_INCLUDE_GUESTS:-1}"  # 1 = also allow 
 MULLVAD_LAN_SUBNET="${MULLVAD_LAN_SUBNET:-}"            # extra subnet(s) to always allow (space/comma sep)
 MULLVAD_COUNTRY_FILTER="${MULLVAD_COUNTRY_FILTER:-}"
 PVE_NODE="${PVE_NODE:-$(hostname -s)}"
+SELECT_GUESTS="${SELECT_GUESTS:-}"      # space/comma vmids to deploy to; empty = menu (TTY) or all (no TTY)
 DRY_RUN="${DRY_RUN:-0}"
 FORCE_REDEPLOY="${FORCE_REDEPLOY:-0}"   # 1 = re-push to already-protected guests too
 
@@ -64,16 +71,21 @@ LOG_FILE="/root/bulkvpn-$(date '+%Y%m%d-%H%M%S').log"
 ### --------------------------------------------------------------------------
 
 SUCCESS=0; SKIPPED=0; FAILED=0
+SELECTED_IDS=""                         # space-separated vmids chosen for deploy
 
-usage() { sed -n '2,42p' "$0"; }
+usage() { sed -n '2,48p' "$0"; }
 [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage; exit 0; }
 
-# Mirror all output to a timestamped log.
-exec > >(tee -a "$LOG_FILE") 2>&1
+# Output is mirrored to a timestamped log from inside main(), *after* the guest
+# selection menu has run — whiptail draws on stderr, so the tee redirect must
+# not be in effect while the menu is on screen.
 
 log()  { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 inc()  { eval "$1=\$(( \${$1} + 1 ))"; }   # set -e-safe counter increment
 die()  { log "FATAL: $*"; exit 1; }
+# is_selected: true iff vmid $1 is in the chosen SELECTED_IDS set (exact-word
+# match so "10" never matches "100").
+is_selected() { [[ " $SELECTED_IDS " == *" $1 "* ]]; }
 
 DRY=false;   [[ "$DRY_RUN" == "1" ]] && DRY=true
 FORCE=false; [[ "$FORCE_REDEPLOY" == "1" ]] && FORCE=true
@@ -550,6 +562,95 @@ process_vm() {
     fi
 }
 
+### ---- Guest enumeration & selection ---------------------------------------
+# list_guests: echo TSV rows "vmid<TAB>status<TAB>name" for one engine.
+list_guests() {   # lxc | qemu
+    pvesh get "/nodes/$PVE_NODE/$1" --output-format json \
+        | jq -r '.[] | [.vmid, .status, .name] | @tsv'
+}
+
+# select_guests: populate SELECTED_IDS with the vmids to deploy to. Enumerates
+# the RUNNING guests once, then resolves the selection from (in priority order):
+#   1. SELECT_GUESTS       — explicit space/comma vmid list (non-interactive)
+#   2. no terminal         — every running guest (historical default; cron/pipe)
+#   3. whiptail checklist  — interactive TUI, all guests pre-checked
+#   4. numbered text prompt — fallback when whiptail is absent
+select_guests() {
+    local vmid status name eng elabel
+    local -a run_ids=() run_desc=()
+    for eng in lxc qemu; do
+        [[ "$eng" == "lxc" ]] && elabel="ct" || elabel="vm"
+        while IFS=$'\t' read -r vmid status name; do
+            [[ "$status" == "running" ]] || continue
+            run_ids+=("$vmid")
+            run_desc+=("$elabel  ${name:-<noname>}")
+        done < <(list_guests "$eng")
+    done
+
+    (( ${#run_ids[@]} > 0 )) || die "no running guests found on node '$PVE_NODE'"
+
+    # 1. Explicit non-interactive selection.
+    if [[ -n "$SELECT_GUESTS" ]]; then
+        local tok
+        for tok in $(printf '%s' "$SELECT_GUESTS" | tr ',' ' '); do
+            if printf '%s\n' "${run_ids[@]}" | grep -qxF "$tok"; then
+                SELECTED_IDS+=" $tok"
+            else
+                log "WARN: SELECT_GUESTS id '$tok' is not a running guest on '$PVE_NODE' — ignoring"
+            fi
+        done
+        SELECTED_IDS="$(printf '%s\n' $SELECTED_IDS | sort -un | paste -sd' ' -)"
+        [[ -n "$SELECTED_IDS" ]] || die "SELECT_GUESTS matched no running guests"
+        return 0
+    fi
+
+    # 2. No terminal → historical behavior: every running guest.
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        SELECTED_IDS="$(printf '%s ' "${run_ids[@]}")"
+        log "No terminal attached and SELECT_GUESTS unset — deploying to all running guests."
+        return 0
+    fi
+
+    # 3. Interactive whiptail checklist.
+    if command -v whiptail >/dev/null 2>&1; then
+        local -a items=() ; local i rc=0 chosen
+        for i in "${!run_ids[@]}"; do
+            items+=("${run_ids[$i]}" "${run_desc[$i]}" ON)
+        done
+        chosen="$(whiptail --title "bulkvpn — select guests" \
+            --checklist "Space toggles, Enter confirms. Deploy the kill-switch to:" \
+            20 72 "$(( ${#run_ids[@]} < 12 ? ${#run_ids[@]} : 12 ))" \
+            "${items[@]}" 3>&1 1>&2 2>&3)" || rc=$?
+        (( rc == 0 )) || { log "Selection cancelled — nothing deployed."; exit 0; }
+        SELECTED_IDS="$(printf '%s' "$chosen" | tr -d '"')"   # tags come back quoted
+        [[ -n "$SELECTED_IDS" ]] || { log "No guests selected — nothing deployed."; exit 0; }
+        return 0
+    fi
+
+    # 4. Plain numbered text fallback.
+    local i tok reply
+    printf '\nSelect guests to deploy the kill-switch to (node %s):\n\n' "$PVE_NODE"
+    for i in "${!run_ids[@]}"; do
+        printf '  %2d) %-8s %s\n' "$(( i + 1 ))" "${run_ids[$i]}" "${run_desc[$i]}"
+    done
+    printf '\nEnter list numbers and/or vmids separated by spaces, or "all" [all]: '
+    read -r reply || reply="all"
+    if [[ -z "$reply" || "$reply" == "all" ]]; then
+        SELECTED_IDS="$(printf '%s ' "${run_ids[@]}")"; return 0
+    fi
+    for tok in $reply; do
+        if printf '%s\n' "${run_ids[@]}" | grep -qxF "$tok"; then
+            SELECTED_IDS+=" $tok"                                 # a vmid
+        elif [[ "$tok" =~ ^[0-9]+$ ]] && (( tok >= 1 && tok <= ${#run_ids[@]} )); then
+            SELECTED_IDS+=" ${run_ids[$(( tok - 1 ))]}"           # a list index
+        else
+            log "WARN: '$tok' is neither a listed number nor a running vmid — ignoring"
+        fi
+    done
+    SELECTED_IDS="$(printf '%s\n' $SELECTED_IDS | sort -un | paste -sd' ' -)"
+    [[ -n "$SELECTED_IDS" ]] || { log "No valid guests selected — nothing deployed."; exit 0; }
+}
+
 ### ---- Cross-guest LAN discovery -------------------------------------------
 # collect_guest_lans: sweep every RUNNING guest once up-front and union their
 # directly-connected LAN subnet(s) into GUEST_LAN_SET, so resolve_lan() can keep
@@ -564,14 +665,14 @@ collect_guest_lans() {
         [[ "$status" == "running" ]] || continue
         detected="$(run_guest lxc "$vmid" "$CMD_DETECT_LAN" 2>/dev/null | tr -d '\r')" || true
         [[ -n "$detected" ]] && subs+=" $detected"
-    done < <(pvesh get "/nodes/$PVE_NODE/lxc" --output-format json | jq -r '.[] | [.vmid, .status, .name] | @tsv')
+    done < <(list_guests lxc)
 
     while IFS=$'\t' read -r vmid status name; do
         [[ "$status" == "running" ]] || continue
         vm_agent_ready "$vmid" || continue   # unreachable VMs are simply not counted
         detected="$(run_guest vm "$vmid" "$CMD_DETECT_LAN" 2>/dev/null | tr -d '\r')" || true
         [[ -n "$detected" ]] && subs+=" $detected"
-    done < <(pvesh get "/nodes/$PVE_NODE/qemu" --output-format json | jq -r '.[] | [.vmid, .status, .name] | @tsv')
+    done < <(list_guests qemu)
 
     GUEST_LAN_SET="$(printf '%s' "$subs" | tr ' ' '\n' | grep -E '/[0-9]+$' | sort -u | tr '\n' ' ')"
     if [[ -n "$GUEST_LAN_SET" ]]; then
@@ -585,10 +686,18 @@ collect_guest_lans() {
 main() {
     require_host_tools
 
+    # Pick which guests to deploy to *before* redirecting output — whiptail draws
+    # on stderr, so the tee redirect below must not be active during the menu.
+    select_guests
+
+    # Mirror all output to a timestamped log from here on.
+    exec > >(tee -a "$LOG_FILE") 2>&1
+
     log "bulkvpn — Mullvad kill-switch bulk deploy"
     local lanmode; [[ "$MULLVAD_LAN_AUTODETECT" == "1" ]] && lanmode="auto${MULLVAD_LAN_SUBNET:+ +($MULLVAD_LAN_SUBNET)}" || lanmode="${MULLVAD_LAN_SUBNET:-RFC1918}"
     [[ "$MULLVAD_LAN_INCLUDE_GUESTS" == "1" ]] && lanmode+=" +all-guests"
     log "Node: $PVE_NODE   LAN: $lanmode   Country: ${MULLVAD_COUNTRY_FILTER:-any}   Dry-run: $DRY   Force-redeploy: $FORCE"
+    log "Selected guests: $SELECTED_IDS"
     log "Log:  $LOG_FILE"
     log "----------------------------------------------------------------------"
 
@@ -606,15 +715,17 @@ main() {
     log "Scanning LXC containers on $PVE_NODE ..."
     while IFS=$'\t' read -r vmid status name; do
         [[ "$status" == "running" ]] || { log "LXC ct/${vmid} (${name}) SKIP — not running"; inc SKIPPED; continue; }
+        is_selected "$vmid" || { log "LXC ct/${vmid} (${name}) SKIP — not selected"; inc SKIPPED; continue; }
         process_lxc "$vmid" "$name" || log "LXC ct/${vmid}: unexpected error (continuing)"
-    done < <(pvesh get "/nodes/$PVE_NODE/lxc" --output-format json | jq -r '.[] | [.vmid, .status, .name] | @tsv')
+    done < <(list_guests lxc)
 
     log "----------------------------------------------------------------------"
     log "Scanning VMs on $PVE_NODE ..."
     while IFS=$'\t' read -r vmid status name; do
         [[ "$status" == "running" ]] || { log "VM vm/${vmid} (${name}) SKIP — not running"; inc SKIPPED; continue; }
+        is_selected "$vmid" || { log "VM vm/${vmid} (${name}) SKIP — not selected"; inc SKIPPED; continue; }
         process_vm "$vmid" "$name" || log "VM vm/${vmid}: unexpected error (continuing)"
-    done < <(pvesh get "/nodes/$PVE_NODE/qemu" --output-format json | jq -r '.[] | [.vmid, .status, .name] | @tsv')
+    done < <(list_guests qemu)
 
     log "----------------------------------------------------------------------"
     log "Done.  SUCCESS=$SUCCESS  SKIPPED=$SKIPPED  FAILED=$FAILED"
